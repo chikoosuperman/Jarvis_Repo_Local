@@ -13,6 +13,7 @@ CRITICAL RULE: You are interacting via VOICE. You MUST keep your answers extreme
 - Speak naturally, directly, and concisely. DO NOT babble.
 
 Modes:
+- Question Answer Mode: answer questions only. And AI bot should not respond to any other command.
 - Study Mode: reduce distractions, assist focus
 - Morning Brief: summarize day
 - Lockdown Mode: require password for sensitive actions`;
@@ -22,16 +23,21 @@ export function useJarvis() {
   const [logs, setLogs] = useState<{ role: "user" | "jarvis" | "system", content: string }[]>([]);
   const [isJarvisSpeaking, setIsJarvisSpeaking] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  
+
   const abortControllerRef = useRef<AbortController | null>(null);
   const awakeTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isAwakeRef = useRef(false);
+  const lastSpokeTimeRef = useRef<number>(0);
 
   useEffect(() => {
     // Check speech state periodically
     if (typeof window !== "undefined") {
       const interval = setInterval(() => {
-        setIsJarvisSpeaking(audioManager?.isSpeaking() || false);
+        const speaking = audioManager?.isSpeaking() || false;
+        if (speaking) {
+          lastSpokeTimeRef.current = Date.now();
+        }
+        setIsJarvisSpeaking(speaking);
       }, 200);
       return () => clearInterval(interval);
     }
@@ -39,18 +45,22 @@ export function useJarvis() {
 
   const handleUserInput = useCallback(async (text: string) => {
     const normalized = text.toLowerCase();
-    
+
     // WAKE WORD LOGIC
     const containsWakeWord = normalized.includes("jarvis");
-    
+
     if (containsWakeWord) {
       isAwakeRef.current = true;
     }
 
-    // 2. INTERRUPT SYSTEM: Only allow interrupts if the wake word is spoken! This prevents the microphone from echoing J.A.R.V.I.S's own voice and interrupting him continuously.
-    if ((audioManager?.isSpeaking() || isProcessing) && !containsWakeWord) {
-        console.log("Ignored echo while speaking:", text);
-        return; // Let him finish!
+    const timeSinceLastSpoke = Date.now() - lastSpokeTimeRef.current;
+
+    // 2. INTERRUPT SYSTEM & ECHO CANCELLATION
+    // The SpeechRecognition API has an ~800ms lag. If it captured J.A.R.V.I.S.'s voice, it will trigger exactly after he finishes + 800ms.
+    // We ignore anything arriving during or up to 2.5 seconds after he speaks unless it contains the wake word explicitly.
+    if ((audioManager?.isSpeaking() || isProcessing || timeSinceLastSpoke < 2500) && !containsWakeWord) {
+      console.log("Ignored echo while speaking or shortly after:", text);
+      return; // Let him finish or ignore post-speech echo
     }
 
     if (audioManager?.isSpeaking() || isProcessing) {
@@ -65,10 +75,10 @@ export function useJarvis() {
     }
 
     if (!isAwakeRef.current) {
-       console.log("Ignored background conversation:", text);
-       return; 
+      console.log("Ignored background conversation:", text);
+      return;
     }
-    
+
     setLogs((prev) => [...prev, { role: "user", content: text }]);
 
     // Native Action checking (e.g. open netflix)
@@ -111,10 +121,10 @@ export function useJarvis() {
           if (done) break;
 
           const chunkText = decoder.decode(value, { stream: true });
-          
+
           // Stream chunks might be JSON lines if using raw ollama output format
           const lines = chunkText.split("\n").filter(l => l.trim() !== "");
-          
+
           for (const line of lines) {
             try {
               const parsed = JSON.parse(line);
@@ -132,18 +142,18 @@ export function useJarvis() {
 
                 // Progressive TTS: when a punctuation is hit, Speak it early!
                 if (/[.!?]\s*$/.test(sentenceBuffer)) {
-                   audioManager?.speak(sentenceBuffer.trim());
-                   sentenceBuffer = ""; // reset buffer
+                  audioManager?.speak(sentenceBuffer.trim());
+                  sentenceBuffer = ""; // reset buffer
                 }
               }
             } catch (e) {
-               // We might receive partial json lines if the stream splits mid-object. 
-               // In production, we should buffer incomplete strings.
-               console.warn("Failed to parse chunk", line);
+              // We might receive partial json lines if the stream splits mid-object. 
+              // In production, we should buffer incomplete strings.
+              console.warn("Failed to parse chunk", line);
             }
           }
         }
-        
+
         // flush remaining buffer 
         if (sentenceBuffer.trim().length > 0) {
           audioManager?.speak(sentenceBuffer.trim());
